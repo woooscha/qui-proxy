@@ -12,12 +12,14 @@ services:
         target: /config/config.json
         read_only: true
       - type: bind
-        source: /mnt/disk4/data
-        target: /mnt/disk4/data
+        source: /mnt
+        target: /disks
         read_only: true
+        bind:
+          propagation: rslave
     networks: [poc]
 
 networks:
   poc:
     external: true
-    name: qui-poc
+    name: embylan

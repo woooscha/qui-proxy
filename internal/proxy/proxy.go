@@ -1,8 +1,7 @@
-// Package proxy implements a deliberately restricted, single-torrent proof of concept.
+// Package proxy implements a deliberately restricted proof of concept.
 package proxy
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
@@ -16,9 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -28,9 +25,8 @@ const xfsMagic = 0x58465342
 type Config struct {
 	Listen        string `json:"listen"`
 	Upstream      string `json:"upstream"`
-	TorrentHash   string `json:"torrent_hash"`
 	VirtualPrefix string `json:"virtual_prefix"`
-	PhysicalData  string `json:"physical_data"`
+	DisksRoot     string `json:"disks_root"`
 }
 
 type handler struct {
@@ -38,7 +34,7 @@ type handler struct {
 	target        *url.URL
 	client        *http.Client
 	proxy         *httputil.ReverseProxy
-	verifyTorrent func(string, []file) error
+	verifyTorrent func(string, []file) (string, string, error)
 }
 
 type file struct {
@@ -62,14 +58,7 @@ func New(c Config) (http.Handler, error) {
 	if err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return nil, errors.New("upstream must be an http(s) origin without credentials or path")
 	}
-	c.TorrentHash = strings.ToLower(c.TorrentHash)
-	if len(c.TorrentHash) != 40 && len(c.TorrentHash) != 64 {
-		return nil, errors.New("torrent_hash must be a 40 or 64 character hex hash")
-	}
-	if _, err := hex.DecodeString(c.TorrentHash); err != nil {
-		return nil, fmt.Errorf("invalid torrent hash: %w", err)
-	}
-	for _, p := range []string{c.VirtualPrefix, c.PhysicalData} {
+	for _, p := range []string{c.VirtualPrefix, c.DisksRoot} {
 		if !filepath.IsAbs(p) || filepath.Clean(p) != p || p == "/" {
 			return nil, errors.New("data paths must be clean, absolute, and not root")
 		}
@@ -110,8 +99,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/api/v2/torrents/files" || r.URL.Path == "/api/v2/torrents/properties" {
 		query, err := url.ParseQuery(r.URL.RawQuery)
-		if err != nil || len(query["hash"]) != 1 || !strings.EqualFold(query["hash"][0], h.cfg.TorrentHash) {
-			http.Error(w, "torrent not enabled in proof of concept", http.StatusForbidden)
+		if err != nil || len(query["hash"]) != 1 || !validHash(query["hash"][0]) {
+			http.Error(w, "invalid torrent hash", http.StatusForbidden)
 			return
 		}
 	}
@@ -136,11 +125,6 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 	if err := resp.Body.Close(); err != nil {
 		return fmt.Errorf("closing upstream response: %w", err)
 	}
-	// Resolve independently on every response, including incremental sync responses.
-	torrent, err := h.fetchTorrent(resp.Request)
-	if err != nil {
-		return err
-	}
 	switch p {
 	case "/api/v2/torrents/info":
 		var list []object
@@ -152,10 +136,8 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 			if err := json.Unmarshal(item["hash"], &hash); err != nil {
 				return fmt.Errorf("decoding torrent hash: %w", err)
 			}
-			if strings.EqualFold(hash, h.cfg.TorrentHash) {
-				if err := h.rewrite(item, torrent); err != nil {
-					return err
-				}
+			if err := h.rewriteTorrent(resp.Request, hash, item); err != nil {
+				return err
 			}
 		}
 		b, err = json.Marshal(list)
@@ -171,10 +153,8 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 			}
 		}
 		for hash, item := range torrents {
-			if strings.EqualFold(hash, h.cfg.TorrentHash) {
-				if err := h.rewrite(item, torrent); err != nil {
-					return err
-				}
+			if err := h.rewriteTorrent(resp.Request, hash, item); err != nil {
+				return err
 			}
 		}
 		if torrents != nil {
@@ -189,7 +169,7 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 		if err := json.Unmarshal(b, &data); err != nil {
 			return fmt.Errorf("decoding properties: %w", err)
 		}
-		if err := h.rewrite(data, torrent); err != nil {
+		if err := h.rewriteTorrent(resp.Request, resp.Request.URL.Query().Get("hash"), data); err != nil {
 			return err
 		}
 		b, err = json.Marshal(data)
@@ -231,66 +211,58 @@ func (h *handler) get(r *http.Request, endpoint string, q url.Values, dst any) e
 	return nil
 }
 
-func (h *handler) fetchTorrent(r *http.Request) (object, error) {
+func (h *handler) fetchTorrent(r *http.Request, requestedHash string) (object, string, string, error) {
+	if !validHash(requestedHash) {
+		return nil, "", "", errors.New("invalid torrent hash")
+	}
 	var list []object
-	if err := h.get(r, "/api/v2/torrents/info", url.Values{"hashes": {h.cfg.TorrentHash}}, &list); err != nil {
-		return nil, err
+	if err := h.get(r, "/api/v2/torrents/info", url.Values{"hashes": {requestedHash}}, &list); err != nil {
+		return nil, "", "", err
 	}
 	if len(list) != 1 {
-		return nil, errors.New("configured torrent missing or ambiguous")
+		return nil, "", "", errors.New("torrent missing or ambiguous")
 	}
 	var hash, save string
 	var progress float64
-	if json.Unmarshal(list[0]["hash"], &hash) != nil || !strings.EqualFold(hash, h.cfg.TorrentHash) || json.Unmarshal(list[0]["save_path"], &save) != nil || json.Unmarshal(list[0]["progress"], &progress) != nil || progress != 1 {
-		return nil, errors.New("torrent identity, save path or completion could not be verified")
+	if json.Unmarshal(list[0]["hash"], &hash) != nil || !strings.EqualFold(hash, requestedHash) || json.Unmarshal(list[0]["save_path"], &save) != nil || json.Unmarshal(list[0]["progress"], &progress) != nil || progress != 1 {
+		return nil, "", "", errors.New("torrent identity, save path or completion could not be verified")
 	}
 	var files []file
-	if err := h.get(r, "/api/v2/torrents/files", url.Values{"hash": {h.cfg.TorrentHash}}, &files); err != nil {
-		return nil, err
+	if err := h.get(r, "/api/v2/torrents/files", url.Values{"hash": {requestedHash}}, &files); err != nil {
+		return nil, "", "", err
 	}
-	if err := h.verifyTorrent(save, files); err != nil {
-		return nil, fmt.Errorf("verifying torrent files: %w", err)
+	source, destination, err := h.verifyTorrent(save, files)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("verifying torrent files: %w", err)
 	}
-	return list[0], nil
+	return list[0], source, destination, nil
 }
 
-func (h *handler) translate(p string) (string, error) {
+func validHash(hash string) bool {
+	if len(hash) != 40 && len(hash) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(hash)
+	return err == nil
+}
+
+func (h *handler) rewriteTorrent(r *http.Request, hash string, item object) error {
+	torrent, source, destination, err := h.fetchTorrent(r, hash)
+	if err != nil {
+		return fmt.Errorf("resolving torrent %s: %w", hash, err)
+	}
+	return h.rewrite(item, torrent, source, destination)
+}
+
+func (h *handler) translate(p, root string) (string, error) {
 	rel, err := filepath.Rel(h.cfg.VirtualPrefix, p)
 	if err != nil || !filepath.IsAbs(p) || filepath.Clean(p) != p || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", errors.New("path outside virtual data root")
 	}
-	return filepath.Join(h.cfg.PhysicalData, rel), nil
+	return filepath.Join(root, rel), nil
 }
 
-func (h *handler) verify(save string, files []file) error {
-	if err := readOnlyMount(h.cfg.PhysicalData); err != nil {
-		return err
-	}
-	root, err := filepath.EvalSymlinks(h.cfg.PhysicalData)
-	if err != nil || root != h.cfg.PhysicalData {
-		return errors.New("physical data root has symlink or is unavailable")
-	}
-	var fs syscall.Statfs_t
-	if err := syscall.Statfs(h.cfg.PhysicalData, &fs); err != nil {
-		return fmt.Errorf("checking filesystem: %w", err)
-	}
-	if uint64(fs.Type) != xfsMagic {
-		return errors.New("physical data is not on xfs")
-	}
-	physical, err := h.translate(save)
-	if err != nil {
-		return err
-	}
-	return h.verifyFiles(physical, files, func(target string) error {
-		var filefs syscall.Statfs_t
-		if err := syscall.Statfs(target, &filefs); err != nil || filefs.Fsid != fs.Fsid || uint64(filefs.Type) != xfsMagic {
-			return errors.New("torrent file is not on the configured xfs filesystem")
-		}
-		return nil
-	})
-}
-
-func (h *handler) verifyFiles(physical string, files []file, filesystemCheck func(string) error) error {
+func (h *handler) verifyFiles(root, physical string, files []file, filesystemCheck func(string) error) error {
 	if len(files) == 0 {
 		return errors.New("empty torrent file list")
 	}
@@ -299,11 +271,11 @@ func (h *handler) verifyFiles(physical string, files []file, filesystemCheck fun
 			return errors.New("invalid or incomplete torrent file")
 		}
 		target := filepath.Join(physical, f.Name)
-		rel, err := filepath.Rel(h.cfg.PhysicalData, target)
+		rel, err := filepath.Rel(root, target)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
 			return errors.New("file escapes physical data root")
 		}
-		current := h.cfg.PhysicalData
+		current := root
 		// Reject symlinks at every component, including the configured root.
 		st, err := os.Lstat(current)
 		if err != nil || !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
@@ -329,41 +301,7 @@ func (h *handler) verifyFiles(physical string, files []file, filesystemCheck fun
 	return nil
 }
 
-// Require the exact data directory as a read-only XFS bind mount. This avoids
-// accepting an ordinary directory left behind after a disk is unmounted.
-func readOnlyMount(root string) error {
-	f, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return fmt.Errorf("opening mount information: %w", err)
-	}
-	defer closeWithLog(f)
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		sep := -1
-		for i, v := range fields {
-			if v == "-" {
-				sep = i
-				break
-			}
-		}
-		if len(fields) < 6 || sep < 6 || sep+1 >= len(fields) {
-			continue
-		}
-		mountpoint := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`).Replace(fields[4])
-		if mountpoint == root && fields[sep+1] == "xfs" {
-			if slices.Contains(strings.Split(fields[5], ","), "ro") {
-				return nil
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("reading mount information: %w", err)
-	}
-	return errors.New("physical data must be an exact read-only xfs mount")
-}
-
-func (h *handler) rewrite(item, verified object) error {
+func (h *handler) rewrite(item, verified object, source, destination string) error {
 	for _, key := range []string{"save_path", "content_path", "download_path"} {
 		raw, ok := item[key]
 		if !ok {
@@ -381,14 +319,18 @@ func (h *handler) rewrite(item, verified object) error {
 		if json.Unmarshal(verified[key], &reference) != nil || reference != value {
 			return fmt.Errorf("%s changed during verification", key)
 		}
-		translated, err := h.translate(value)
+		translated, err := h.translate(value, destination)
 		if err != nil {
 			return fmt.Errorf("translating %s: %w", key, err)
 		}
 		// Non-save paths must exist without symlinks; their meaning depends on qBittorrent's settings.
 		if key != "save_path" {
-			resolved, err := filepath.EvalSymlinks(translated)
-			if err != nil || resolved != translated {
+			physical, err := h.translate(value, source)
+			if err != nil {
+				return err
+			}
+			resolved, err := filepath.EvalSymlinks(physical)
+			if err != nil || resolved != physical {
 				return fmt.Errorf("unverified %s", key)
 			}
 		}
