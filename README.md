@@ -44,4 +44,4 @@ Separata bind mounts per disk begränsar åtkomst men kräver ändringar av Dock
 
 Avsett för Linux och Go 1.26+. Kör `go mod tidy`, `go fmt ./...`, `go fix ./...`, `go vet ./...`, `golangci-lint run ./...` och `go test -race ./...` i den ordningen före commit. Testerna använder temporära kataloger och en simulerad qBittorrent-server; de ersätter inte test av en riktig XFS-mount eller qui.
 
-I denna arbetsmiljö saknas Go-kompilator och golangci-lint; miljöns nätverksproxy kunde inte nås för att installera Go. Docker-klienten saknar åtkomst till Docker-daemonen. Därför har koden, testerna och Docker-imagen **inte kunnat byggas eller köras**. Verifiera dem innan användning. Inga autentiseringsuppgifter eller anslutningar till användarens Unraid-miljö fanns tillgängliga.
+Go-bygget, lintkontrollen och race-testerna har körts i utvecklingsmiljön med en simulerad qBittorrent-server. Docker-imagen har inte verifierats. Ingen anslutning till användarens Unraid-miljö eller test mot verklig qui, XFS, reflink eller seedning har gjorts. Följ den manuella verifieringen innan användning.
