@@ -1,12 +1,16 @@
 package proxy
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -150,7 +154,7 @@ func TestSyncIncrementalAndLogin(t *testing.T) {
 		case "/api/v2/torrents/files":
 			writeResponse(t, w, `[{"name":"movie","size":3,"progress":1}]`)
 		case "/api/v2/sync/maindata":
-			writeResponse(t, w, `{"rid":42,"full_update":false,"torrents":{"`+hash+`":{"save_path":"/data/tv","state":"uploading"}}}`)
+			writeResponse(t, w, `{"rid":42,"full_update":true,"torrents":{"`+hash+`":{"save_path":"/data/tv","state":"uploading"}}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -172,14 +176,14 @@ func TestSyncIncrementalAndLogin(t *testing.T) {
 	req.AddCookie(cookies[0])
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
-	if w.Code != 200 || !strings.Contains(w.Body.String(), `"rid":42`) || !strings.Contains(w.Body.String(), `"full_update":false`) || !strings.Contains(w.Body.String(), `"save_path":"/disk4/tv"`) {
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"full_update":true`) || !strings.Contains(w.Body.String(), `"save_path":"/disk4/tv"`) {
 		t.Fatalf("unexpected sync response: %d %s", w.Code, w.Body.String())
 	}
 	h.verifyTorrent = func(string, []file) (string, string, error) { return "", "", errors.New("disk missing") }
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, req)
-	if w.Code != 502 {
-		t.Fatalf("verification failure returned %d", w.Code)
+	if w.Code != 200 || strings.Contains(w.Body.String(), hash) {
+		t.Fatalf("verification failure returned %d %s", w.Code, w.Body.String())
 	}
 }
 
@@ -292,7 +296,7 @@ func TestMultipleTorrents(t *testing.T) {
 		case "/api/v2/torrents/properties":
 			writeResponse(t, w, `{"save_path":"/data/second"}`)
 		case "/api/v2/sync/maindata":
-			writeResponse(t, w, `{"rid":23,"full_update":false,"torrents":{"`+hashA+`":{"save_path":"/data/first"},"`+hashB+`":{"save_path":"/data/second"}}}`)
+			writeResponse(t, w, `{"rid":23,"full_update":true,"torrents":{"`+hashA+`":{"save_path":"/data/first"},"`+hashB+`":{"save_path":"/data/second"}}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -305,9 +309,9 @@ func TestMultipleTorrents(t *testing.T) {
 		status     int
 	}{
 		{"info", "/api/v2/torrents/info", false, []string{`"save_path":"/disk1/first"`, `"save_path":"/disk20/second"`}, http.StatusOK},
-		{"incremental sync", "/api/v2/sync/maindata?rid=22", false, []string{`"rid":23`, `"full_update":false`, `"save_path":"/disk1/first"`, `"save_path":"/disk20/second"`}, http.StatusOK},
+		{"incremental sync", "/api/v2/sync/maindata?rid=22", false, []string{`"full_update":true`, `"save_path":"/disk1/first"`, `"save_path":"/disk20/second"`}, http.StatusOK},
 		{"second properties", "/api/v2/torrents/properties?hash=" + hashB, false, []string{`"save_path":"/disk20/second"`}, http.StatusOK},
-		{"one disk missing", "/api/v2/torrents/info", true, nil, http.StatusBadGateway},
+		{"one disk missing", "/api/v2/torrents/info", true, []string{`"save_path":"/disk1/first"`}, http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -340,9 +344,122 @@ func TestMultipleTorrents(t *testing.T) {
 					t.Fatalf("missing %s in %s", want, w.Body.String())
 				}
 			}
-			if tc.fail && (strings.Contains(w.Body.String(), "/data/") || strings.Contains(w.Body.String(), "/disk")) {
+			if tc.fail && (strings.Contains(w.Body.String(), "/data/") || strings.Contains(w.Body.String(), "/disk20/") || strings.Contains(w.Body.String(), hashB)) {
 				t.Fatalf("verification failure leaked paths: %s", w.Body.String())
 			}
 		})
+	}
+}
+
+func TestSyncVisibilityLifecycle(t *testing.T) {
+	t.Parallel()
+	hash := strings.Repeat("a", 40)
+	var safe atomic.Bool
+	safe.Store(true)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/sync/maindata":
+			if r.URL.Query().Get("rid") != "0" {
+				t.Errorf("upstream received rid %q", r.URL.Query().Get("rid"))
+			}
+			writeResponse(t, w, `{"rid":4,"full_update":true,"categories":{"tv":{"name":"tv"}},"tags":["tag"],"trackers":{"tracker":["`+hash+`"]},"torrents":{"`+hash+`":{"save_path":"/data/tv","name":"test torrent","state":"uploading","progress":1}}}`)
+		case "/api/v2/torrents/info":
+			writeResponse(t, w, `[{"hash":"`+hash+`","save_path":"/data/tv","progress":1}]`)
+		case "/api/v2/torrents/files":
+			writeResponse(t, w, `[{"name":"file","size":1,"progress":1}]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	raw, err := New(Config{Listen: ":0", Upstream: upstream.URL, VirtualPrefix: "/data", DisksRoot: "/disks"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := raw.(*handler)
+	h.verifyTorrent = func(string, []file) (string, string, error) {
+		if !safe.Load() {
+			return "", "", errors.New("file missing")
+		}
+		return "/disks/disk4/data", "/disk4", nil
+	}
+	request := func(rid int, sid string) map[string]json.RawMessage {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v2/sync/maindata?rid=%d", rid), nil)
+		req.AddCookie(&http.Cookie{Name: "SID", Value: sid})
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("sync returned %d: %s", w.Code, w.Body.String())
+		}
+		var data map[string]json.RawMessage
+		if err := json.Unmarshal(w.Body.Bytes(), &data); err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	readRID := func(data map[string]json.RawMessage) int {
+		t.Helper()
+		var rid int
+		if err := json.Unmarshal(data["rid"], &rid); err != nil || rid == 0 {
+			t.Fatalf("invalid rid %s: %v", data["rid"], err)
+		}
+		return rid
+	}
+	initial := request(0, "one")
+	firstRID := readRID(initial)
+	if string(initial["full_update"]) != "true" || !strings.Contains(string(initial["torrents"]), `"save_path":"/disk4/tv"`) {
+		t.Fatalf("initial: %s", initial)
+	}
+	safe.Store(false)
+	missing := request(firstRID, "one")
+	missingRID := readRID(missing)
+	if string(missing["full_update"]) != "false" || !strings.Contains(string(missing["torrents_removed"]), hash) || strings.Contains(string(missing["torrents"]), hash) || strings.Contains(string(missing["trackers"]), hash) || !strings.Contains(string(missing["trackers_removed"]), "tracker") {
+		t.Fatalf("missing: %s", missing)
+	}
+	retry := request(firstRID, "one")
+	if !strings.Contains(string(retry["torrents_removed"]), hash) {
+		t.Fatalf("retry lost removal: %s", retry)
+	}
+	other := request(firstRID, "different")
+	if string(other["full_update"]) != "true" {
+		t.Fatalf("other session did not receive full update: %s", other)
+	}
+	safe.Store(true)
+	restored := request(missingRID, "one")
+	if string(restored["full_update"]) != "false" || !strings.Contains(string(restored["torrents"]), `"name":"test torrent"`) || !strings.Contains(string(restored["torrents"]), `"state":"uploading"`) || !strings.Contains(string(restored["torrents"]), `"save_path":"/disk4/tv"`) {
+		t.Fatalf("restored: %s", restored)
+	}
+}
+
+func TestSyncMetadataRemovals(t *testing.T) {
+	t.Parallel()
+	h := &handler{}
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/sync/maindata", nil)
+	req = req.WithContext(context.WithValue(req.Context(), syncRIDKey{}, "0"))
+	first, err := h.syncResponse(req, []byte(`{"full_update":true,"categories":{"tv":{}},"tags":["tag"],"trackers":{"tracker":["hash"]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(first, &data); err != nil {
+		t.Fatal(err)
+	}
+	var rid int
+	if err := json.Unmarshal(data["rid"], &rid); err != nil {
+		t.Fatal(err)
+	}
+	req = req.WithContext(context.WithValue(req.Context(), syncRIDKey{}, fmt.Sprint(rid)))
+	second, err := h.syncResponse(req, []byte(`{"full_update":true,"categories":{},"tags":[],"trackers":{}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(second, &data); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{"categories_removed": `["tv"]`, "tags_removed": `["tag"]`} {
+		if string(data[key]) != want {
+			t.Fatalf("%s = %s, want %s", key, data[key], want)
+		}
 	}
 }

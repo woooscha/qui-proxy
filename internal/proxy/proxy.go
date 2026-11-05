@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,7 @@ type handler struct {
 	client        *http.Client
 	proxy         *httputil.ReverseProxy
 	verifyTorrent func(string, []file) (string, string, error)
+	syncState     syncHistory
 }
 
 type file struct {
@@ -71,6 +73,9 @@ func New(c Config) (http.Handler, error) {
 		r.SetURL(u)
 		r.Out.Host = u.Host
 		r.Out.Header.Del("Accept-Encoding")
+		if r.In.URL.Path == "/api/v2/sync/maindata" {
+			r.Out.URL.RawQuery = "rid=0"
+		}
 	}
 	h.proxy.ModifyResponse = h.modifyResponse
 	h.proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
@@ -104,6 +109,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if r.URL.Path == "/api/v2/sync/maindata" {
+		r = r.WithContext(context.WithValue(r.Context(), syncRIDKey{}, r.URL.Query().Get("rid")))
+	}
 	h.proxy.ServeHTTP(w, r)
 }
 
@@ -131,39 +139,23 @@ func (h *handler) modifyResponse(resp *http.Response) error {
 		if err := json.Unmarshal(b, &list); err != nil {
 			return fmt.Errorf("decoding torrent list: %w", err)
 		}
+		visible := make([]object, 0, len(list))
 		for _, item := range list {
 			var hash string
 			if err := json.Unmarshal(item["hash"], &hash); err != nil {
 				return fmt.Errorf("decoding torrent hash: %w", err)
 			}
 			if err := h.rewriteTorrent(resp.Request, hash, item); err != nil {
-				return err
+				slog.Warn("hiding torrent", "hash", hash, "reason", err)
+				continue
 			}
+			visible = append(visible, item)
 		}
+		list = visible
 		b, err = json.Marshal(list)
 	case "/api/v2/sync/maindata":
-		var data object
-		if err := json.Unmarshal(b, &data); err != nil {
-			return fmt.Errorf("decoding sync: %w", err)
-		}
-		var torrents map[string]object
-		if v, ok := data["torrents"]; ok {
-			if err := json.Unmarshal(v, &torrents); err != nil {
-				return fmt.Errorf("decoding sync torrents: %w", err)
-			}
-		}
-		for hash, item := range torrents {
-			if err := h.rewriteTorrent(resp.Request, hash, item); err != nil {
-				return err
-			}
-		}
-		if torrents != nil {
-			data["torrents"], err = json.Marshal(torrents)
-			if err != nil {
-				return err
-			}
-		}
-		b, err = json.Marshal(data)
+		b, err = h.syncResponse(resp.Request, b)
+
 	default:
 		var data object
 		if err := json.Unmarshal(b, &data); err != nil {
