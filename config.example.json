@@ -1,0 +1,7 @@
+{
+  "listen": ":8088",
+  "upstream": "http://172.18.0.20:8080",
+  "torrent_hash": "REPLACE_WITH_40_OR_64_HEX_CHARACTER_INFOHASH",
+  "virtual_prefix": "/data",
+  "physical_data": "/mnt/disk4/data"
+}

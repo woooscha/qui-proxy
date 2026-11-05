@@ -1,0 +1,23 @@
+services:
+  proxy:
+    build: .
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: ./config.json
+        target: /config/config.json
+        read_only: true
+      - type: bind
+        source: /mnt/disk4/data
+        target: /mnt/disk4/data
+        read_only: true
+    networks: [poc]
+
+networks:
+  poc:
+    external: true
+    name: qui-poc
